@@ -1,0 +1,351 @@
+#!/usr/bin/env python
+
+TEST_DATA = '''nod /dev/null 666 0 0 c 1 3
+# this is a comment
+
+dir /dev/pts 755 0 0
+slink /dev/sr0 scd0 777 0 0'''
+
+import sys
+import os
+import stat
+import errno
+import optparse
+
+DEBUG = 1
+
+def program_name():
+    return os.path.basename(sys.argv[0])
+
+def make_dirs(path):
+    try:
+        os.makedirs(path)
+    except OSError, e:
+        if e.errno != errno.EEXIST:
+            raise
+
+def symlink_force(target, new):
+    try:
+        os.symlink(target, new)
+    except OSError, e:
+        if e.errno != errno.EEXIST:
+            raise
+        os.unlink(new)
+        os.symlink(target, new)
+
+def mknod(filename, dev_type, major, minor):
+    if dev_type == 'c':
+        mode = stat.S_IFCHR
+    elif dev_type == 'b':
+        mode = stat.S_IFBLK
+    else:
+        raise TypeError
+
+    dev = os.makedev(major, minor)
+    try:
+        os.mknod(filename, mode, dev)
+    except OSError, e:
+        if e.errno != errno.EEXIST:
+            raise
+        st = os.stat(filename)
+        if st.st_mode & mode and st.st_rdev == dev:
+            return
+        else:
+            os.unlink(filename)
+            os.mknod(filename, mode, os.makedev(major, minor))
+
+main_function_list = []
+
+def main_function(func, default=False):
+    'main_function: decorator for busybox style program_name dispatch'
+    global main_function_list
+    main_function_list.append(func)
+    return func
+
+def main_multicall_dispatch(args):
+    'use like main_multicall_dispatch(sys.argv[1:])'
+    global main_function_list
+    name_to_main = dict( (x.__name__.replace('_', '-'), x)
+                        for x in main_function_list )
+    try:
+        main_func = name_to_main[program_name()]
+    except KeyError, e:
+        sys.stderr.write('program name "%s" is not supported, must be one of: %s\n' %
+                        (program_name(), name_to_main.keys()) )
+        sys.exit(2)
+    main_func(args)
+
+def class_name_to_format(class_name):
+    return class_name.lower()
+
+class InitramfsListType(object):
+    def __init__(self, *args, **kwargs):
+        if len(args) > len(self.format):
+            raise TypeError
+        for (i, value) in enumerate(args):
+            setattr(self, self.format[i], value)
+        for (key, value) in kwargs.iteritems():
+            #FIXME: inefficient check for kwargs covering args
+            if key in self.__dict__:
+                raise TypeError
+            else:
+                self.__dict__[key] = value
+    def __str__(self):
+        out = [ class_name_to_format(self.__class__.__name__) ]
+        for i in self.format:
+            value = getattr(self, i)
+            if i == 'mode':
+                out.append('%03o' % value)
+            else:
+                out.append('%s' % value)
+        return ' '.join(out)
+    def __repr__(self):
+        return '<' + str(self) + '>'
+
+class Nod(InitramfsListType):
+    format = [ 'name', 'mode', 'uid', 'gid', 'dev_type', 'maj', 'min' ]
+class Dir(InitramfsListType):
+    format = [ 'name', 'mode', 'uid', 'gid' ]
+class SLink(InitramfsListType):
+    format = [ 'name', 'target', 'mode', 'uid', 'gid' ]
+
+def initramfs_list_types():
+    return [ value for value in globals().itervalues()
+            if type(value) == type and issubclass(value, InitramfsListType)
+            and value != InitramfsListType ]
+
+INITRAMFS_LIST_NAME_TO_CLASS = dict([ (class_name_to_format(x.__name__), x)
+        for x in initramfs_list_types() ])
+
+class ParseListError(Exception):
+    pass
+def initramfs_list_parse_helper(fields):
+    f = fields
+    try:
+        cls = INITRAMFS_LIST_NAME_TO_CLASS[f[0]]
+    except KeyError, e:
+        raise ParseListError('encountered type "%s", only supports %s.'
+                'fields: %s' % (f[0], list(INITRAMFS_LIST_NAME_TO_CLASS.keys()), f))
+    if len(f) != len(cls.format) + 1:
+        raise ParseListError('invalid number of fields, got %d instead of %d.'
+                'fields: %s' % (len(f), len(cls.format)+1, f))
+
+    d = {}
+    for (i, fmt) in enumerate(cls.format):
+        field = f[i+1]
+        if fmt in [ 'name', 'target' ]:
+            d[fmt] = field
+        elif fmt == 'mode':
+            d[fmt] = int(field, base=8)
+        elif fmt in [ 'uid', 'gid', 'maj', 'min' ]:
+            d[fmt] = int(field)
+        elif fmt == 'dev_type':
+            if field not in [ 'b', 'c']:
+                raise ParseListError('invalid dev_type: "%s".'
+                        'fields: %s' % (field, f))
+            d[fmt] = field
+    return cls(**d)
+
+def initramfs_list_parse(lines):
+    for i in lines:
+        # strip comments
+        try:
+            j = i.index('#')
+        except ValueError:
+            pass
+        else:
+            i = i[:j]
+
+        f = i.strip().split()
+        # by pass empty lines
+        if not f:
+            continue
+
+        yield initramfs_list_parse_helper(f)
+
+def test_initramfs_parse():
+    o = []
+    for i in initramfs_list_parse(TEST_DATA.split('\n')):
+        o.append('%s' % i)
+
+    test_data_out = [ x for x in TEST_DATA.split('\n') if x and not x.startswith('#') ]
+    try:
+        assert o == test_data_out
+    except AssertionError:
+        sys.stderr.write('%s\ntest_data_out:\n%s\n' % (o, test_data_out))
+        raise
+
+def to_device_table(initramfs_type):
+    '''-> line in device table
+    NOTE: caramfs device table cannot represent symbolic links'''
+    i = initramfs_type
+    out = [ i.name ]
+    if isinstance(i, Nod):
+        out.append(i.dev_type)
+    elif isinstance(i, Dir):
+        out.append('d')
+    elif isinstance(i, SLink): 
+        return '# %s symbolic link to %s' % (i.name, i.target)
+    else:
+        raise TypeError
+    for j in [ 'mode', 'uid', 'gid', 'maj', 'min', ]:
+        try:
+            value = getattr(i, j)
+        except AttributeError:
+            out.append('-')
+        else:
+            if j == 'mode':
+                out.append('%03o' % value)
+            else:
+                out.append('%s' % value)
+    # start, inc, count fields are always set to '-'
+    for j in xrange(3):
+        out.append('-')
+    return '\t'.join(out)
+
+def initramfs_list_to_device_table(initramfs_list):
+    '-> lines'
+    for i in initramfs_list:
+        yield to_device_table(i)
+
+def initramfs_list_create_symlinks(initramfs_list, root_dir):
+    'creates symlinks under root_dir'
+    for i in initramfs_list:
+        if not isinstance(i, SLink):
+            continue
+        # ensure relative path to make os.path.join work
+        if os.path.isabs(i.name):
+            i.name = i.name[1:]
+        link_path = os.path.join(root_dir, i.name)
+        #FIXME: ignores mode, uid, gid
+        if DEBUG > 1:
+            sys.stderr.write('%s: symlink("%s", "%s")\n' % (program_name(), i.target, link_path))
+        try:
+            symlink_force(i.target, link_path)
+        except OSError, e:
+            if e.errno != errno.ENOENT:
+                raise
+            make_dirs(os.path.dirname(link_path))
+            symlink_force(i.target, link_path)
+            if DEBUG > 2:
+                sys.exit(1)
+
+def initramfs_strip_dir_prefix(list_item, dir_prefix):
+    def strip_prefix(s, prefix):
+        new = s[len(prefix):]
+        if not new:
+            new = '/'
+        return new
+
+    n = getattr(list_item, 'name', None)
+    if n and n.startswith(dir_prefix):
+        list_item.name = strip_prefix(n, dir_prefix)
+    # change target SLink
+    t = getattr(list_item, 'target', None)
+    if t and t.startswith(dir_prefix):
+        list_item.target = strip_prefix(t, dir_prefix)
+    return list_item
+
+def test_initramfs_list_to_device_table():
+    l = list(initramfs_list_parse(TEST_DATA.split('\n')))
+    out = list(initramfs_list_to_device_table(l))
+    try:
+        assert out == [
+                '/dev/null\tc\t666\t0\t0\t1\t3\t-\t-\t-',
+                '/dev/pts\td\t755\t0\t0\t-\t-\t-\t-\t-',
+                '# /dev/sr0 symbolic link to scd0'
+        ]
+    except AssertionError:
+        print >> sys.stderr, out
+
+    l = map(lambda x: initramfs_strip_dir_prefix(x, '/dev'), l)
+    out_stripped = list(initramfs_list_to_device_table(l))
+    try:
+        assert out_stripped == [
+                '/null\tc\t666\t0\t0\t1\t3\t-\t-\t-',
+                '/pts\td\t755\t0\t0\t-\t-\t-\t-\t-',
+                '# /sr0 symbolic link to scd0'
+        ]
+    except AssertionError:
+        print >> sys.stderr, out_stripped
+
+@main_function
+def cpio_list_to_device_table(args):
+    op = optparse.OptionParser(usage = 'usage: %prog [ OPTIONS ] INITRAMFS_LIST', option_list=[
+        optparse.Option('--test', help='just run the unit tests',
+            dest='test', action='store_true', default=False),
+        optparse.Option('--create-symlinks',
+            help='just create symbolic links according to INITRAMFS_LIST under CREATE_SYMLINKS_ROOT',
+            dest='create_symlinks_root', default=None),
+        optparse.Option('--strip-dir-prefix',
+            help='strip dir prefix from all filenames in INITRAMFS_LIST',
+            dest='strip_dir_prefix', default=None),
+        optparse.Option('-o', '--output', help='the path to write the device_table to',
+            dest='output', default=sys.stdout),
+        ])
+
+    if DEBUG > 1:
+        sys.stderr.write('%s: args:%s\n' % (program_name(), args))
+
+    (options, args) = op.parse_args(args)
+
+    if options.test:
+        test_initramfs_parse()
+        test_initramfs_list_to_device_table()
+        sys.exit(0)
+
+    try:
+        (initramfs_list_path,) = args
+    except ValueError:
+        op.print_help()
+        sys.exit(2)
+
+
+    if isinstance(options.output, basestring):
+        f = open(options.output, 'w')
+    else:
+        f = options.output
+    l = initramfs_list_parse(open(initramfs_list_path)) 
+    if options.strip_dir_prefix:
+        l = map(lambda x: initramfs_strip_dir_prefix(x, options.strip_dir_prefix), l)
+
+    if options.create_symlinks_root:
+        initramfs_list_create_symlinks(l, options.create_symlinks_root) 
+        sys.exit(0)
+
+    for i in initramfs_list_to_device_table(l):
+        f.write('%s\n' % i)
+
+DEBUG = 1
+
+@main_function
+def cpio_list_mknod(args):
+    try:
+        (cpio_list_path, dest_dir) = args
+    except ValueError:
+        sys.stderr.write('%s CPIO_LIST DEST_DIR\n' % (program_name(),))
+        sys.exit(2)
+    l = initramfs_list_parse(open(cpio_list_path)) 
+    for i in l:
+        if i.name.startswith('/'):
+            t = i.name[1:]
+        else:
+            t = i.name
+        dest_path = os.path.join(dest_dir, t)
+        if DEBUG:
+            sys.stderr.write('%s\n' % (i,))
+        if isinstance(i, Nod):
+            try:
+                mknod(dest_path, i.dev_type, i.maj, i.min)
+            except OSError, e:
+                if e.errno != errno.EPERM:
+                    raise
+                sys.stderr.write('%s: mknod failed (%s), re-run this as root\n' % (program_name(), os.strerror(e.errno)))
+                sys.exit(1)
+        elif isinstance(i, Dir):
+            make_dirs(dest_path)
+        elif isinstance(i, SLink):
+            symlink_force(i.target, dest_path)
+
+if __name__ == '__main__':
+    main_multicall_dispatch(sys.argv[1:])

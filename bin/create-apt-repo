@@ -1,0 +1,12 @@
+#!/bin/bash
+
+case $# in
+1) DEBS=$1 ;;
+*) printf 'usage: create-deb-repo DEB-DIR'>&2 ; exit 2 ;;
+esac
+
+for i in i386 x86_64; do
+	pushd $DEBS/$i
+	dpkg-scanpackages . /dev/null | dpkg-scanpackages-post-process Packages.gz
+	popd
+done

@@ -1,0 +1,16 @@
+#!/bin/bash
+##SHELL_BEFORE_START##
+@@SHELL_BEFORE@@
+##SHELL_BEFORE_END##
+XZ_START=$((@@XZ_START@@ + 1))
+XZ=`mktemp -u`
+XZ_SIZE=@@XZ_SIZE@@
+SKIP=$(($XZ_START + $XZ_SIZE + 1 ))
+tail -n +$XZ_START $0 |head -n $XZ_SIZE > $XZ && chmod +x $XZ
+tail -n +$SKIP $0 | $XZ -d - | tar xvf -
+rm -f $XZ
+##SHELL_AFTER_START##
+@@SHELL_AFTER@@
+##SHELL_AFTER_END##
+exit 0
+##XZ_BIN_START##

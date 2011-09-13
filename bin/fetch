@@ -1,0 +1,297 @@
+#!/usr/bin/env python
+
+import sys
+import os
+import errno
+import re
+import pprint
+import optparse
+import shutil
+import subprocess
+
+
+# support python >= 2.4
+try:
+	from hashlib import sha1 as sha1_new
+except ImportError:
+	from sha import sha as sha1_new
+
+try:
+	from subprocess import check_call as subprocess_check_call
+except ImportError:
+	import subprocess
+
+	class CalledProcessError(Exception):
+		def __init__(self, cmd, returncode):
+			(self.cmd, self.returncode) = (cmd, returncode)
+		def __str__(self):
+			return '%s returned %d' % (self.cmd, self.returncode)
+		__repr__ = __str__
+
+	def subprocess_check_call(*args, **kwargs):
+		r = subprocess.call(*args, **kwargs)
+		if r != 0:
+			raise CalledProcessError(args, r)
+
+DEBUG = 1
+VERBOSE = 1
+
+def program_name():
+	return os.path.basename(sys.argv[0])
+
+def make_dirs(p):
+	try:
+		os.makedirs(p)
+	except OSError, e:
+		if e.errno != errno.EEXIST:
+			raise
+
+# NOTE: no separate 'prep' (extract and patch) step, import pristine source and patches into a git repo for patch management
+# FIXME: git: verify fetched revision
+# FIXME: git: verify working directory revision
+
+def file_name_from_url(url):
+	# http://sourceforge.net/projects/oprofile/files/oprofile/0.9.4/oprofile-0.9.4.tar.gz/download -> oprofile-0.9.4.tar.gz
+	if url.startswith('http://sourceforge.net') and url.endswith('/download'):
+		url = url[:-len('/download')]
+	return url[url.rfind('/')+1:]
+
+def file_sha1sum_matches(filename, sha1_digest):
+	try:
+		f = open(filename)
+	except IOError:
+		return False
+	sum = sha1_new()
+	while 1:
+		t = f.read(2**20)
+		if not t:
+			break
+		sum.update(t)
+	return sum.hexdigest() == sha1_digest
+
+def fetch_http(pkg_info, dest_name, verbose=1):
+	tarball_dir = os.environ.get('TARBALL_DIR', os.path.expanduser('~/packages/opensource'))
+	(url, sha1sum) = pkg_info['url'], pkg_info['sha1sum']
+
+	if 'tarball_name' in pkg_info:
+		filename = pkg_info['tarball_name']
+	else:
+		filename = file_name_from_url(url)
+	t = os.path.join(tarball_dir, filename)
+	if 'extracted_name' in pkg_info:
+		extracted_name = pkg_info['extracted_name']
+	else:
+		m = re.match(r'(.*)\.tar\.[^.]*$', filename)
+		if m:
+			extracted_name = m.groups()[0]
+		else:
+			extracted_name = filename[:filename.rfind('.')]
+
+	assert(extracted_name)
+	if not dest_name:
+		dest_name = extracted_name
+
+	if os.path.isdir(dest_name):
+		if verbose:
+			sys.stderr.write('%s: "%s" exists, skipping\n' % (program_name(), dest_name))
+		return
+
+	if not file_sha1sum_matches(t, sha1sum):
+		make_dirs(tarball_dir)
+		subprocess_check_call(['wget', '-O', t, url])
+		if not file_sha1sum_matches(t, sha1sum):
+			sys.stderr.write('%s: "%s": checksum mismatch, remove this corrupt file\n' % (program_name(), filename))
+			sys.exit(3)
+
+	if '.tar.' in filename:
+		subprocess_check_call(['tar', '-xf', t])
+	else:
+		subprocess_check_call(['unzip', '-o', t]) # -o: overwrite
+
+	if extracted_name != dest_name:
+		shutil.move(extracted_name, dest_name)
+
+def fetch_rsync(pkg_info, dest_name, verbose=1):
+	tarball_dir = os.environ.get('TARBALL_DIR', os.path.expanduser('~/packages/binary'))
+	(url, sha1sum) = pkg_info['rsync'], pkg_info['sha1sum']
+
+	if 'tarball_name' in pkg_info:
+		filename = pkg_info['tarball_name']
+	else:
+		filename = file_name_from_url(url)
+	t = os.path.join(tarball_dir, filename)
+	if 'extracted_name' in pkg_info:
+		extracted_name = pkg_info['extracted_name']
+	else:
+		m = re.match(r'(.*)\.tar\.[^.]*$', filename)
+		if m:
+			extracted_name = m.groups()[0]
+		else:
+			extracted_name = filename[:filename.rfind('.')]
+
+	assert(extracted_name)
+	if not dest_name:
+		dest_name = extracted_name
+
+	if os.path.isdir(dest_name):
+		if verbose:
+			sys.stderr.write('%s: "%s" exists, skipping\n' % (program_name(), dest_name))
+		return
+
+	if not file_sha1sum_matches(t, sha1sum):
+		make_dirs(tarball_dir)
+		subprocess_check_call(['rsync', '-hvv', '--progress', url, t])
+		if not file_sha1sum_matches(t, sha1sum):
+			sys.stderr.write('%s: "%s": checksum mismatch, remove this corrupt file\n' % (program_name(), filename))
+			sys.exit(3)
+
+	if '.tar.' in filename:
+		subprocess_check_call(['tar', '-xf', t])
+	else:
+		subprocess_check_call(['unzip', '-o', t]) # -o: overwrite
+
+	if extracted_name != dest_name:
+		shutil.move(extracted_name, dest_name)
+
+def git_revision_exists(repo_path, revision):
+	'assume already in git repo directory'
+	dev_null = open('/dev/null', 'w')
+	r = subprocess.call(['git', 'show', revision], stdout=dev_null, cwd=repo_path)
+	return r == 0
+
+def git_current_branch(dest_name):
+	from subprocess import Popen,PIPE
+	output = subprocess.Popen(['git', 'status', '-b', '--short'], stdout=PIPE, stderr=None, cwd=dest_name, close_fds=True).communicate()[0]
+	branch = output.split()[1]
+	if branch is 'HEAD':
+		return None
+	else:
+		return branch
+
+def fetch_git(pkg_info, dest_name):
+	'@arg(revision) can be a branch or tag'
+	# repo_dir: directory full of 'bare' git repositories fetched from upstream
+	repo_dir = os.environ.get('REPO_DIR', os.path.expanduser('~/repos'))
+
+	url = pkg_info['git']
+
+	if 'revision' in pkg_info:
+		revision = pkg_info['revision']
+
+	if 'branch' in pkg_info:
+		revision = branch = pkg_info['branch']
+		if revision and (revision != branch):
+			sys.stderr.write('Error: Can NOT set both branch & revision.\n');
+			sys.exit(2)
+	else:
+		branch = None
+
+	if url.endswith('/'):
+		url = url[:-1]
+
+	# repo_name: ex: 'linux-omap-2.6.git'
+	repo_name = url[url.rfind('/')+1:]
+	# repo_dest_path servies as a download cache
+	repo_dest_path = os.path.join(repo_dir, repo_name)
+
+	# dest_name: 'linux-omap-2.6'
+	if not dest_name:
+		dest_name = repo_name
+		if dest_name.endswith('.git'):
+			dest_name = dest_name[:-len('.git')]
+	assert(dest_name)
+
+	# repo_dest_path is a bare git repository that serves like a download cache
+	# dest_name is the non-bare git repository used for compilation
+	# data flow: url -> repo_dest_path -> dest_name
+	if os.path.exists(repo_dest_path):
+		if not git_revision_exists(repo_dest_path, revision):
+			if VERBOSE:
+				sys.stderr.write(str(['git', 'fetch', '--tags', url, 'refs/*:refs/*']) + '\n')
+			subprocess_check_call(['git', 'fetch', '--tags', url, 'refs/*:refs/*'], cwd=repo_dest_path)
+	else:
+		# FIXME: git clone doesn't take a '-r REVISION' like hg
+		subprocess_check_call(['git', 'clone', '--mirror', url, repo_dest_path]) # --mirror implies --bare
+
+	if os.path.exists(dest_name):
+		if not git_revision_exists(dest_name, revision):
+			if VERBOSE:
+				sys.stderr.write(str(['git', 'fetch', '--tags', repo_dest_path]) + '\n')
+			# FIXME: does this fetch new branches?
+			subprocess_check_call(['git', 'fetch', '--tags', repo_dest_path], cwd=dest_name)
+	else:
+		# FIXME: git clone doesn't take a '-r REVISION' like hg
+		subprocess_check_call(['git', 'clone', repo_dest_path, dest_name])
+		# setup two git remote repos in 'dest_name':
+		# 1. rename 'repo_dest_path' from 'origin' to 'download-cache'
+		# 2. add 'url' as 'origin'
+		subprocess_check_call(['git', 'remote', 'rename', 'origin', 'download-cache'], cwd=dest_name)
+		subprocess_check_call(['git', 'remote', 'add', 'origin', url], cwd=dest_name)
+		subprocess_check_call(['git', 'fetch', 'origin'], cwd=dest_name)
+		subprocess_check_call(['git', 'fetch', '--tags', 'origin'], cwd=dest_name)
+		# 3. git config reviewboard.url
+		reviewboard_url = pkg_info.get('reviewboard_url', '')
+		if reviewboard_url:
+			if VERBOSE:
+				sys.stderr.write(str(['git', 'config', 'reviewboard.url', reviewboard_url]) + '\n')
+			subprocess_check_call(['git', 'config', 'reviewboard.url', reviewboard_url], cwd=dest_name)
+
+	current_branch = git_current_branch(dest_name)
+
+	if branch is not None:
+		if current_branch != branch:
+			if VERBOSE:
+				sys.stderr.write('Switch from ' + current_branch + ' to ' + branch + ' \n')
+				sys.stderr.write(str(['git', 'checkout', '--track', 'origin/' + branch, '-B' , branch]) + ' \n')
+			subprocess_check_call(['git', 'checkout', '--track', 'origin/' + branch, '-B', branch], cwd=dest_name)
+		else:
+			if VERBOSE:
+				sys.stderr.write(str(['git', 'checkout', branch]) + '\n')
+			subprocess_check_call(['git', 'checkout', branch ], cwd=dest_name)
+	else:
+		if VERBOSE:
+			sys.stderr.write(str(['git', 'checkout', '--quiet', revision]) + '\n')
+		subprocess_check_call(['git', 'checkout', '--quiet', revision], cwd=dest_name)
+
+def fetch(pkg_info_dict, dest_name):
+	if 'url' in pkg_info_dict:
+		fetch_http(pkg_info_dict, dest_name)
+	elif 'git' in pkg_info_dict:
+		fetch_git(pkg_info_dict, dest_name)
+	elif 'rsync' in pkg_info_dict:
+		fetch_rsync(pkg_info_dict, dest_name)
+	else:
+		raise ValueError('don\'t know how to fetch package: \"%s\"' % pkg_info_dict)
+
+def main(args):
+	op = optparse.OptionParser(usage='usage: %prog [OPTIONS] LIST_OF_URL_CHECKSUM_IN_PYTHON_DICT_SYNTAX', option_list=[
+		optparse.Option('--dest', dest='dest', default=None, help='destination directory'),
+		optparse.Option('--just-print', action='store_true', dest='just_print',
+						default=False, help='print URL, checksum and exit'),
+	])
+	(options, args) = op.parse_args(args)
+	if len(args) != 1:
+		op.print_help()
+		sys.exit(2)
+
+	dicts = eval(args[0], {}, {})
+	if DEBUG > 1:
+		pprint.pprint(options)
+		pprint.pprint(dicts)
+
+	for i in dicts:
+		if options.just_print:
+			sys.stdout.write('%s\n' % (i,))
+		else:
+			if VERBOSE:
+				if 'url' in i:
+					url = i['url']
+				elif 'rsync' in i:
+					url = i['rsync']
+				else:
+					url = i['git']
+				sys.stderr.write('%s: %s\n' % (program_name(), url))
+			fetch(i, options.dest)
+
+if __name__ == '__main__':
+	main(sys.argv[1:])

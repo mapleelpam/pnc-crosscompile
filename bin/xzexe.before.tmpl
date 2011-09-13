@@ -1,0 +1,6 @@
+#!/bin/bash
+if [ $((`id -u`)) != 0 ]; then
+	echo -ne "\nFor runtime root privilege please install with 'sudo'\n"
+	echo -ne "\tExample: sudo $0\n\n"
+	exit -1
+fi

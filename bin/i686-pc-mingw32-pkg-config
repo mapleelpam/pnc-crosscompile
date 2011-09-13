@@ -1,0 +1,4 @@
+#!/bin/bash
+export PKG_CONFIG_LIBDIR=$PKG_CONFIG_PATH
+unset PKG_CONFIG_PATH
+/usr/bin/pkg-config $@

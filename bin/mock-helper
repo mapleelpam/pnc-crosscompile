@@ -1,0 +1,28 @@
+#!/usr/bin/env python
+
+import sys
+import os
+import subprocess
+
+program_name = os.path.basename(sys.argv[0])
+
+if not program_name.startswith('mock-'):
+    sys.stderr.write('%(program_name)s: invalid executable name: \"%(program_name)s\". Must start with "mock-"\n' % dict(program_name=program_name))
+    sys.exit(2)
+
+args = sys.argv[1:]
+if program_name.endswith('-init'):
+    if len(args) != 1:
+        sys.stderr.write('%s: SSH-PRVIATE-KEY-FOR_git.remobo.net\n' % (program_name,))
+        sys.exit(2)
+    ssh_privkey = args[0]
+    mock_config = program_name[len('mock-'):-len('-init')]
+    packages = [ x.strip() for x in open(os.path.join(os.environ.get('PREFIX', '.'), 'scripts', 'remobo-build.epel5.packages')).readlines() ]
+    subprocess.call(['mock', '-r', mock_config, '--init'])
+    subprocess.call(['mock', '-r', mock_config, '--install'] + packages)
+    subprocess.call(['sudo', './bin/ssh-privkey-%s' % (mock_config,), ssh_privkey])
+else:
+    mock_config = program_name[len('mock-'):]
+    if not args:
+        args = [ '--shell', ]
+    subprocess.call(['mock', '-r', mock_config] + args)

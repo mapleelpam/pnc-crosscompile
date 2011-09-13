@@ -1,0 +1,42 @@
+#!/usr/bin/env python
+
+# see: http://libguestfs.org/recipes.html#tar2vm
+import sys
+import os
+import subprocess
+import tempfile
+
+def program_name():
+    return os.path.basename(sys.argv[0])
+
+def print_usage_exit():
+    sys.stderr.write('usage: %(program_name)s SRC_DIR IMG_FILENAME IMG_SIZE\n'
+                     'ex: %(program_name)s /nfsroot hd.img 32M\n' % dict(program_name=program_name()))
+    sys.exit(2)
+
+def main(args):
+    try:
+        (src_dir, img_filename, img_size) = args
+    except ValueError:
+        print_usage_exit()
+
+    src_tarball = tempfile.NamedTemporaryFile(mode='w+')
+    subprocess.check_call(['tar', '-C', src_dir, '-c', '.'], stdout=src_tarball)
+    src_tarball.flush()
+    src_tarball.seek(0)
+
+    tf = tempfile.TemporaryFile(mode='w+')
+    tf.write('''
+             alloc %(img_filename)s %(img_size)s
+             launch
+             part-disk /dev/sda mbr
+             mkfs ext2 /dev/sda1
+             mount /dev/sda1 /
+             tar-in %(src_tarball)s /
+             umount-all
+             ''' % dict(src_tarball=src_tarball.name, img_filename=img_filename, img_size=img_size))
+    tf.seek(0)
+    subprocess.check_call(['guestfish'], stdin=tf)
+
+if __name__ == '__main__':
+    main(sys.argv[1:])

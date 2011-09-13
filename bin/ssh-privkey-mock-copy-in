@@ -1,0 +1,52 @@
+#!/usr/bin/env python
+
+import sys
+import os
+import errno
+import shutil
+import subprocess
+
+def make_dirs(p):
+    try:
+        os.makedirs(p)
+    except OSError, e:
+        if e.errno != errno.EEXIST:
+            raise
+
+program_name = os.path.basename(sys.argv[0])
+if not program_name.startswith('ssh-privkey-'):
+    sys.stderr.write('%(program_name)s: invalid executable name: \"%(program_name)s\". '
+                     'Must start with "ssh-privkey-"\n' % dict(program_name=program_name))
+
+mock_config = program_name[len('ssh-privkey-'):]
+
+args = sys.argv[1:]
+if len(args) != 1:
+    sys.stderr.write('usage: %(program_name)s SSH-PRIVATE-KEY-FOR-git.remobo.net\n' % dict(program_name=program_name))
+    sys.exit(2)
+
+ssh_privkey = args[0]
+
+mock_root = os.path.join('/var/lib/mock', mock_config, 'root')
+
+# copy ssh_privkey into chroot as /root/.ssh/id_rsa
+ssh_config_dir = os.path.join(mock_root, 'root', '.ssh')
+make_dirs(ssh_config_dir)
+shutil.copy(ssh_privkey, os.path.join(ssh_config_dir, 'id_rsa'))
+
+# generate .ssh/config in chroot
+f = open(os.path.join(ssh_config_dir, 'config'), 'w')
+f.write('Host git.remobo.net\n'
+        'User ec2-user\n'
+        'Compression yes\n'
+        'PasswordAuthentication no\n'
+       )
+f.close()
+
+# generate <env_name>.env in chroot
+env_name = os.environ.get('ENV_NAME', 'remobo')
+f = open(os.path.join(mock_root, env_name) + '.env', 'w')
+f.write('ssh-agent > ssh-agent-tmp-out\n'
+        'source ssh-agent-tmp-out\n'
+       )
+f.close()

@@ -1,0 +1,299 @@
+#!/usr/bin/env python
+
+import sys
+import os
+import errno
+import subprocess
+import optparse
+
+import multidict # local copy of paste.util.multidict
+
+SHOW_CMD = 2
+
+#'/home/scottt/qemu-usb-gotemp/bin/qemu-system-arm',
+#'/home/scottt/qemu-usb-gotemp-0.12/bin/qemu-system-arm',
+#'/home/scottt/qemu-scottt/bin/qemu-system-arm',
+#'/home/scottt/qemu-next/bin/qemu-system-arm',
+#'/home/scottt/qemu/bin/qemu-system-arm',
+#'/home/scottt/qemu-master/bin/qemu-system-arm',
+#'/home/scottt/qemu-markmc/bin/qemu-system-arm',
+#'/home/scottt/qemu-0.12/bin/qemu-system-arm',
+#'/home/scottt/qemu-0.11/bin/qemu-system-arm',
+#'/home/scottt/qemu-0.10/bin/qemu-system-arm',
+#'qemu-system-arm',
+qemu_executable = os.environ.get('QEMU_BIN', None)
+
+args = sys.argv[1:]
+program_name = os.path.basename(sys.argv[0])
+qopts = multidict.MultiDict()
+cmd_append = []
+
+option_parser = optparse.OptionParser(option_list=[
+    optparse.Option('--just-print', action='store_true', help='Print  the  commands  that  would  be executed, but do not execute them'),
+    optparse.Option('--gdb-server', action='store_true', help='Start gdb server on TCP port 1234'),
+    optparse.Option('--nfsroot', action='store_true', help='Use the environment variable TARGET_DIR as the nfsroot directory'),
+])
+(options, args) = option_parser.parse_args(args)
+
+def net_tap_option(scripts_dict, vlan='0', ifname='tap0'):
+    # FIXME: use -net,fd=XX to replace -net,script=,downscript=
+    out = [ 'tap,vlan=%(vlan)s,ifname=%(ifname)s' % dict(vlan=vlan, ifname=ifname), ]
+    script = scripts_dict.get('ifup', None)
+    if script:
+        out.append(',script=' + script)
+    downscript = scripts_dict.get('ifdown', None)
+    if downscript:
+        out.append(',downscript=' + downscript)
+    return ''.join(out)
+
+def is_arm_versatile_or_realview(program_name):
+    return program_name in [ 'arm-versatilepb', 'arm-versatilbepb-v6', 'arm-realview-eb-v6', 'arm-realview-eb-mpcore-v6', 'arm-realview-eb-mpcore-v6' ]
+
+def helping_cdall_at_vmware_debug_newtork_problem(program_name):
+    return 0
+    #return is_arm_versatile_or_realview(program_name)
+
+if helping_cdall_at_vmware_debug_newtork_problem(program_name):
+    cdall_at_vmware_scripts = dict(ifup='./qemu-ifup', ifdown='./qemu-ifdown')
+    qopts['net'] = 'nic,vlan=0'
+    qopts.add('net', net_tap_option(cdall_at_vmware_scripts))
+    qopts['hda'] = 'rootfs.ext2'
+    qopts['append'] = 'console=ttyAMA0 root=/dev/sda rootfstype=ext2 rw'
+
+USB = 0
+if USB and is_arm_versatile_or_realview(program_name):
+    # qemu versatilepb and realview-eb machines have OHCI usb controller on the PCI bus
+    qopts['usb'] = True
+
+# settings for arm
+serial_device = 'ttyAMA0'
+nic_model = None
+if not qemu_executable:
+    qemu_executable = 'qemu-system-arm'
+
+net_already_configured = 0
+if program_name == 'arm-integratorcp':
+    qopts['machine'] = 'integratorcp'
+    #qopts['kernel'] = './zImage-2.6.30-integratorcp-v5'
+    qopts['kernel'] = './zImage-2.6.32-integratorcp-v5'
+elif program_name == 'arm-versatilepb':
+    qopts['machine'] = 'versatilepb'
+    qopts['kernel'] = './zImage-2.6.32-versatilepb-v5'
+elif program_name == 'arm-versatilepb-v6':
+    qopts['cpu'] = 'arm1136-r2' # qemu versatilepb default cpu is 'arm926'
+    qopts['machine'] = 'versatilepb'
+    qopts['kernel'] = './zImage'
+elif program_name == 'arm-realview-eb-v6':
+    qopts['cpu'] = 'arm1136-r2' # qemu realview-eb default cpu is 'arm926'
+    qopts['memory'] = '256'
+    qopts['machine'] = 'realview-eb'
+    # known good kernel
+    #qopts['kernel'] = './uImage-2.6.28-arm2-realview-v6'
+    # experimental
+    #qopts['kernel'] = os.path.expanduser('~/work/kernel/arm/arch/arm/boot/zImage')
+    #qopts['kernel'] = os.path.expanduser('../qemu-network-hang/zImage-2.6.32-realview-eb-qemu-v6')
+    qopts['kernel'] = './zImage-2.6.32-realview-eb-v6'
+elif program_name == 'arm-realview-eb-mpcore-v6':
+    qopts['machine'] = 'realview-eb-mpcore'
+    qopts['kernel'] = './uImage-2.6.28-arm2-realview-v6-smp'
+    qopts['smp'] = '4'
+    qopts['memory'] = '1024'
+elif program_name.endswith('-zImage'):
+    qopts['kernel'] = './linux-2.6/arch/arm/boot/zImage'
+elif program_name.endswith('-bzImage'):
+    # FIXME: settings for x86
+    qopts['kernel'] = './linux-2.6/arch/x86/boot/bzImage'
+    serial_device = 'ttyS0'
+    nic_model = 'virtio'
+    qemu_executable = 'qemu-system-x86_64'
+    disk = 1
+    if disk:
+        # -drive file=file,index=0,media=disk
+        qopts['drive'] = 'file=virtual-machine/hd.img,index=0,media=disk,if=virtio'
+elif program_name in ('qemu-nfsroot-user-socket-1', 'qemu-nfsroot-user-socket-2'):
+    disk = 0
+    qopts['kernel'] = './linux-2.6/arch/x86/boot/bzImage'
+    serial_device = 'ttyS0'
+    nic_model = 'virtio'
+    qemu_executable = 'qemu-system-x86_64'
+
+    if program_name.endswith('-1'):
+        tap_interface = 'tap1'
+        net_socket_ip = '7.0.0.1'
+        net_socket_gw = '7.0.0.2'
+        nfs_server = '172.34.55.1'
+        net_tap_ip = '172.34.55.2'
+        net_tap_ifup_script = 'scripts/qemu-ifup-nfs4tap1'
+        net_socket_listen_connect = 'listen=localhost:1234'
+        net_user_ip = '10.0.2.63'
+        host_port = '4567'
+    elif program_name.endswith('-2'):
+        tap_interface = 'tap2'
+        net_socket_ip = '7.0.0.2'
+        net_socket_gw = '7.0.0.1'
+        nfs_server = '172.34.66.1'
+        net_tap_ip = '172.34.66.2'
+        net_tap_ifup_script = 'scripts/qemu-ifup-nfs4tap2'
+        net_socket_listen_connect = 'connect=localhost:1234'
+        net_user_ip = '10.0.2.64'
+        host_port = '5678'
+
+    # vlan0: tap: nfsroot, net_tap_ifup_script sets of tapX on the HOST
+    qopts['net'] = 'nic,model=%(nic_model)s,vlan=0' % dict(nic_model=nic_model)
+    qopts.add('net', 'tap,vlan=0,ifname=%(tap_interface)s,script=%(qemu_ifup)s' % dict(tap_interface=tap_interface, qemu_ifup=net_tap_ifup_script))
+    # vlan1: socket
+    qopts.add('net', 'nic,model=%(nic_model)s,vlan=1' % dict(nic_model=nic_model))
+    qopts.add('net', 'socket,vlan=1,%(net_socket_listen_connect)s' % dict(net_socket_listen_connect=net_socket_listen_connect))
+    # vlan2: user, a.k.a SLIRP: NAT and port forwarding
+    # forward 'host_port' to guest port 1080: socks5
+    qopts.add('net', 'nic,model=%(nic_model)s,vlan=2' % dict(nic_model=nic_model))
+    qopts.add('net', 'user,vlan=2,hostfwd=tcp:127.0.0.1:%(host_port)s-%(net_user_ip)s:1080' % dict(host_port=host_port, net_user_ip=net_user_ip))
+    # kernel command line
+    qopts['append'] = ('console=%(serial_device)s '
+                       'ip=%(net_socket_ip)s::%(net_socket_gw)s:255.0.0.0::eth1:none '
+                       'ip=%(net_user_ip)s:::255.255.255.0::eth2:none '
+                       'root=/dev/nfs nfsroot=%(nfs_server)s:%(target_dir)s,nfsvers=3 rw '
+                       'ip=%(net_tap_ip)s:::255.255.255.0::eth0:none' %
+                       dict(serial_device=serial_device, target_dir=os.environ['TARGET_DIR'],
+                            net_socket_ip=net_socket_ip, net_socket_gw=net_socket_gw, net_tap_ip=net_tap_ip,
+                            nfs_server=nfs_server, net_user_ip=net_user_ip))
+    ## BAD: non-nfs-iface must be listed before nfs ones.
+    ##BAD##qopts['append'] = ('console=%(serial_device)s  root=/dev/nfs nfsroot=172.20.0.1:%(target_dir)s,nfsvers=3 rw ip=172.20.0.2::172.20.0.1:255.255.255.0::eth0:none ip=7.0.0.1:::255.0.0.0::eth1:none' %
+    ##BAD##    dict(serial_device=serial_device, target_dir=os.environ['TARGET_DIR']))
+    if program_name.endswith('-2'):
+        cmd = ['google-chrome', '--proxy-server=socks5://localhost:%(host_port)s' % dict(host_port=host_port)]
+        sys.stderr.write('%s: %s\n' % (program_name, cmd))
+        if not options.just_print:
+            try:
+                subprocess.Popen(cmd)
+            except OSError, e:
+                # allow 'No such file or directory' for browser executable
+                if e.errno != errno.ENOENT:
+                    raise
+    net_already_configured = 1
+elif program_name.endswith('-kernel'):
+    cmd_append = [ '-kernel', ]
+elif len(args) == 0:
+    qopts['kernel'] = '/dev/null'
+    cmd_append = [ '-S', ]
+else:
+    pass
+
+scottt_scripts = dict(ifup='./scripts/qemu-ifup')
+if not net_already_configured:
+    if nic_model:
+        qopts['net'] = 'nic,model=%(nic_model)s,vlan=0' % dict(nic_model=nic_model)
+    else:
+        qopts['net'] = 'nic,vlan=0'
+    tap_vlan = options.nfsroot
+    if tap_vlan:
+        qopts.add('net', net_tap_option(scottt_scripts))
+    else:
+        qopts.add('net', 'user')
+
+    if options.nfsroot:
+        assert(tap_vlan) # assume connecting to nfs server on the host through a tap interface
+        # NOTE: tap interface IP on the host side hard coded in qemu-ifup script as well
+        # qemu {-net,-netdev} needs corresponding 'ip=' option on the linux kernel command line or other configuration actions in the guest
+        qopts['append'] = ('console=%(serial_device)s root=/dev/nfs nfsroot=172.20.0.1:%(target_dir)s,nfsvers=3 rw ip=172.20.0.2::172.20.0.1:255.255.255.0' %
+            dict(serial_device=serial_device, target_dir=os.environ['TARGET_DIR']))
+    else:
+        qopts['append'] = ('console=%(serial_device)s root=/dev/vda1 rw ip=10.0.2.15::10.0.2.1:255.255.255.0' %
+            dict(serial_device=serial_device))
+
+# qemu net hotplug:
+# (qemu) pci_add auto nic vlan=1,model=virtio # guest must have CONFIG_HOTPLUG_PCI_ACPI (acpiphp.ko), also: "info pci", "pci_del"
+# (qemu) host_net_add user vlan=1 # see also: "info network"
+# SLIRP a.k.a user mode port forwarding
+# (qemu) hostfwd_add 1 user.0 tcp::4567-GUEST_IP:1080 # see also "info usernet"
+
+# qemu network configuration through different versions:
+# pre 0.12: -net nic,model=virtio,vlan=1  -net tap,vlan=0
+# 0.12:     -device virtio-net-pci,vlan=1     -net tap,vlan=0
+# 0.12:     -device virtio-net-pci,id=netdev0 -netdev type=tap,id=netdev0
+# -net creates a vlan within qemu, see: '(qemu) info network'
+# -netdev does _NOT_ create a vlan within qemu but relies on vhost-net within the host kernel(?), see:
+# https://fedoraproject.org/wiki/Features/VHostNet
+# http://www.linux-kvm.org/page/VhostNet
+
+TESTING_KGDB = 0
+if TESTING_KGDB:
+    # connect qemu-system-arm's first serial port which is also our serial console to a telnet server
+    qopts['serial'] = 'tcp:localhost:2345,server'
+    qopts['append'] = qopts.get('append', '') + ' kgdboc=ttyAMA0 kgdbwait' # kgdbcon is not supported over kgdboc
+
+cmd = [ qemu_executable ]
+GRAPHICS = 0
+if GRAPHICS:
+    cmd.extend(['-serial', 'stdio'])
+else:
+    cmd.extend(['-nographic'])
+
+if options.gdb_server:
+    cmd.extend(['-s'])
+
+machine = qopts.get('machine', None)
+if machine:
+    cmd.extend(['-M', machine])
+
+cpu = qopts.get('cpu', None)
+if cpu:
+    cmd.extend(['-cpu', cpu])
+
+smp = qopts.get('smp', None)
+if smp:
+    cmd.extend(['-smp', smp])
+
+memory = qopts.get('memory', None)
+if memory:
+    cmd.extend(['-m', memory ])
+
+kernel = qopts.get('kernel', None)
+if kernel:
+    cmd.extend(['-kernel', kernel])
+
+hda = qopts.get('hda', None)
+if hda:
+    cmd.extend(['-hda', hda])
+
+def multi_option(qopts, opt_name):
+    values = qopts.getall(opt_name, None)
+    if not values:
+        return []
+    out = []
+    for i in values:
+        out.append('-%s' % (opt_name,))
+        out.append('%s' % (i,))
+    return out
+
+cmd.extend(multi_option(qopts, 'serial'))
+#'-device', 'QEMU USB Thermometer',
+cmd.extend(multi_option(qopts, 'device'))
+cmd.extend(multi_option(qopts, 'netdev'))
+cmd.extend(multi_option(qopts, 'net'))
+cmd.extend(multi_option(qopts, 'drive'))
+
+usb = qopts.get('usb', None)
+if usb:
+    cmd.extend(['-usb'])
+
+#'-usbdevice', 'serial::null',
+#'-usbdevice', 'thermometer',
+#'-usbdevice', 'thermometer:controlled_by_monitor',
+cmd.extend(multi_option(qopts, 'usbdevice'))
+
+append = qopts.get('append', None)
+if append:
+    cmd.extend(['-append', append])
+
+cmd = cmd + cmd_append + args
+if SHOW_CMD > 1:
+    sys.stderr.write('%s: %s\n' % (program_name, cmd))
+if SHOW_CMD:
+    sys.stderr.write('%s\n' % (' '.join(cmd),))
+
+if options.just_print:
+    sys.exit(0)
+else:
+    r = subprocess.call(cmd)
+    sys.exit(r)
