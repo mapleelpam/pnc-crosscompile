@@ -145,6 +145,7 @@ endif
 CFLAGS += -fstack-protector --param=ssp-buffer-size=4
 ifeq ($(findstring mingw32,$(HOST)), mingw32)
 LDFLAGS += $(shell $(CC) -print-file-name=libssp.a)
+CFLAGS += -DMINGW
 endif
 
 #########
